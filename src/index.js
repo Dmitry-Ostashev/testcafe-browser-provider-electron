@@ -14,6 +14,11 @@ import Helpers from './helpers';
 import ERRORS from './errors';
 
 import testRunTracker from 'testcafe/lib/api/test-run-tracker';
+import { BrowserClient } from 'testcafe/lib/browser/provider/built-in/dedicated/chrome/cdp-client';
+import ChromeRunTimeInfo from 'testcafe/lib/browser/provider/built-in/dedicated/chrome/runtime-info';
+import NativeAutomation from 'testcafe/lib/native-automation';
+import { dispatchEvent as dispatchNativeAutomationEvent, navigateTo } from 'testcafe/lib/native-automation/utils/cdp';
+import { EventType } from 'testcafe/lib/native-automation/types';
 
 const DEBUG_LOGGER = debug('testcafe:browser-provider-electron');
 const STDOUT_LOGGER = DEBUG_LOGGER.extend('spawn:stdout');
@@ -22,7 +27,7 @@ const STDERR_LOGGER = DEBUG_LOGGER.extend('spawn:stderr');
 function startElectron (config, ports) {
     var cmd            = '';
     var args           = null;
-    var debugPortsArgs = [`--inspect-brk=${ports[1]}`];
+    var debugPortsArgs = [`--inspect-brk=${ports[1]}`, `--remote-debugging-port=${ports[2]}`];
     var extraArgs      = config.appArgs || [];
 
     if (OS.mac && statSync(config.electronPath).isDirectory()) {
@@ -51,6 +56,7 @@ async function injectHookCode (client, code) {
 const ElectronBrowserProvider = {
     isMultiBrowser: true,
     openedBrowsers: {},
+    runtimeInfo:    {},
 
     _getBrowserHelpers () {
         var testRun = testRunTracker.resolveContextTestRun();
@@ -59,11 +65,37 @@ const ElectronBrowserProvider = {
         return ElectronBrowserProvider.openedBrowsers[id].helpers;
     },
 
+    _createRunTimeInfo (hostName, config, disableMultipleWindows) {
+        return ChromeRunTimeInfo.create(hostName, config, disableMultipleWindows);
+    },
+
+    async _setupNativeAutomation ({ browserId, browserClient, runtimeInfo, nativeAutomationOptions }) {
+        const cdpClient = await browserClient.getActiveClient();
+        const nativeAutomation = new NativeAutomation(browserId, cdpClient);
+
+        await nativeAutomation.init(nativeAutomationOptions);
+
+        runtimeInfo.nativeAutomation = nativeAutomation;
+    },
+
+    async _getActiveCDPClient (browserId) {
+        const { browserClient } = this.openedBrowsers[browserId];
+        const cdpClient         = await browserClient.getActiveClient();
+
+        return cdpClient;
+    },
+
+    async _delay (ms) {
+        return new Promise(
+            resolve => setTimeout(resolve, ms)
+        );
+    },
+    
     async isLocalBrowser () {
         return true;
     },
 
-    async openBrowser (id, pageUrl, mainPath) {
+    async openBrowser (id, pageUrl, mainPath, { nativeAutomation }) {
         if (!isAbsolute(mainPath))
             mainPath = path.join(process.cwd(), mainPath);
 
@@ -72,7 +104,9 @@ const ElectronBrowserProvider = {
 
         await ipcServer.start();
 
-        var ports = await getFreePorts(2);
+        var ports = await getFreePorts(3);
+
+        const cdpPort = ports[2];
 
         startElectron(config, ports);
 
@@ -95,11 +129,25 @@ const ElectronBrowserProvider = {
             }));
         }
 
-        this.openedBrowsers[id] = {
-            config:  config,
-            ipc:     ipcServer,
-            helpers: new Helpers(ipcServer)
+
+        const runtimeInfo = { 
+            config,
+            cdpPort,
+
+            browserId: id,
+            ipc:       ipcServer,
+            helpers:   new Helpers(ipcServer)
         };
+
+        const browserClient = new BrowserClient(runtimeInfo);
+
+        runtimeInfo.browserClient = browserClient;
+        this.openedBrowsers[id]   = runtimeInfo;
+
+        await browserClient.init();
+
+        if (nativeAutomation)
+            await this._setupNativeAutomation({ browserId: id, browserClient, runtimeInfo, nativeAutomationOptions: nativeAutomation });
     },
 
     async closeBrowser (id) {
@@ -147,7 +195,34 @@ const ElectronBrowserProvider = {
 
     async getContextMenuItem (menuItemSelector) {
         return ElectronBrowserProvider._getBrowserHelpers().getContextMenuItem(menuItemSelector);
-    }
+    },
+
+    async openFileProtocol (browserId, url) {
+        const cdpClient = await this._getActiveCDPClient(browserId);
+
+        await navigateTo(cdpClient, url);
+    },
+
+    async dispatchNativeAutomationEvent (browserId, type, options) {
+        const cdpClient = await this._getActiveCDPClient(browserId);
+
+        await dispatchNativeAutomationEvent(cdpClient, type, options);
+    },
+
+    async dispatchNativeAutomationEventSequence (browserId, eventSequence) {
+        const cdpClient = await this._getActiveCDPClient(browserId);
+
+        for (const event of eventSequence) {
+            if (event.type === EventType.Delay)
+                await this._delay(event.options.delay);
+            else
+                await dispatchNativeAutomationEvent(cdpClient, event.type, event.options);
+        }
+    },
+
+    supportNativeAutomation () {
+        return true;
+    },
 };
 
 export { ElectronBrowserProvider as default };

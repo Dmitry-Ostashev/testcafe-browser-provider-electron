@@ -5,7 +5,7 @@ import isAbsolute from './is-absolute';
 import CONSTANTS from '../constants';
 
 
-const PROTOCOL_RE = /^([\w-]+?)(?=\:\/\/)/;
+const PROTOCOL_RE = /^([\w-]+?)(?=\:\/\/)/; // eslint-disable-line no-useless-escape
 
 export default function (id, mainPath) {
     let configPath = mainPath;
